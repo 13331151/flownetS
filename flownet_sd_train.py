@@ -3,13 +3,13 @@
 
 # In[1]:
 
-get_ipython().magic(u'pylab inline')
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
 import cv2
 import os
 import time
 import scipy.io as sio   
+import numpy as np
 # gpu_id = 0
 # os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
@@ -39,8 +39,12 @@ config.EPS = 1e-8
 
 config.train_data_path = '/data/kitti/FlyingChairs_release/train_tfrecord'
 config.test_data_path = '/data/kitti/FlyingChairs_release/test_tfrecord'
-config.finetune_data_path = './finetune_tfrecord'
 config.isFinetune = False
+
+config.vis_iter = 10000
+config.print_iter = 1000
+config.test_iter = 5000
+config.save_iter = 50000
 
 if config.isFinetune:
     config.learning_rate *= .5
@@ -68,6 +72,11 @@ try:
     os.mkdir(config.result_dir)
 except:
     os.system("rm "+config.result_dir+"/*")
+    
+try:
+    os.mkdir(config.result_dir+'/test')
+except:
+    os.system("rm "+config.result_dir+"/test/*")
 
 
 # In[4]:
@@ -146,19 +155,22 @@ class Model(object):
         self.sess = tf.Session(config = tfconfig)
         
         self.inputs, self.labels = read_and_decode(config.train_data_path, shuffle=True)
-        self.test_inputs, self.test_labels = read_and_decode(config.test_data_path, shuffle=False)
+        self.test_inputs, self.test_labels = read_and_decode(config.test_data_path, shuffle=True)
         self.labels_small_64 = tf.image.resize_images(self.labels, [config.patch_size/64, config.patch_size/64])
         self.labels_small_32 = tf.image.resize_images(self.labels, [config.patch_size/32, config.patch_size/32])
         self.labels_small_16 = tf.image.resize_images(self.labels, [config.patch_size/16, config.patch_size/16])
         self.labels_small_8 = tf.image.resize_images(self.labels, [config.patch_size/8, config.patch_size/8])
         self.labels_small_4 = tf.image.resize_images(self.labels, [config.patch_size/4, config.patch_size/4])
         
+        self.test_labels_small_4 = tf.image.resize_images(self.test_labels, [config.patch_size/4, config.patch_size/4])
+        
         self.summary_inputs_0 = tf.summary.image('train/input/image1', self.inputs[:, :, :, :3], max_outputs=1)
         self.summary_inputs_1 = tf.summary.image('train/input/image2', self.inputs[:, :, :, 3:], max_outputs=1)
-        self.summary_labels = tf.summary.image('train/labels', self.labels[:, :, :, :1], max_outputs=1)
-        self.summary_labels_small_4 = tf.summary.image('train/labels_small_4', self.labels_small_4[:, :, :, :1], max_outputs=1)
+#         self.summary_labels = tf.summary.image('train/labels', self.labels[:, :, :, :1], max_outputs=1)
+#         self.summary_labels_small_4 = tf.summary.image('train/labels_small_4', self.labels_small_4[:, :, :, :1], max_outputs=1)
         
         predict_64, predict_32, predict_16, predict_8, predict_4 = self.FLOWNETS(self.inputs)
+        _, _, _, _, test_predict_4 = self.FLOWNETS(self.test_inputs, True)
         self.summary_outputs = tf.summary.image('train/predict_4', predict_4[:, :, :, :1], max_outputs=1)
         
         self.predict_4 = predict_4
@@ -168,13 +180,18 @@ class Model(object):
 #         loss_train_16 = tf.losses.absolute_difference(predict_16, self.labels_small_16)
 #         loss_train_32 = tf.losses.absolute_difference(predict_32, self.labels_small_32)
 #         loss_train_64 = tf.losses.absolute_difference(predict_64, self.labels_small_64)
+
         loss_train_4 = epe_loss(predict_4, self.labels_small_4)
         loss_train_8 = epe_loss(predict_8, self.labels_small_8)
         loss_train_16 = epe_loss(predict_16, self.labels_small_16)
         loss_train_32 = epe_loss(predict_32, self.labels_small_32)
         loss_train_64 = epe_loss(predict_64, self.labels_small_64)
         
+        loss_test_4 = epe_loss(test_predict_4, self.test_labels_small_4)
+        
         self.loss_train = 0.005*loss_train_4+0.01*loss_train_8+0.02*loss_train_16+0.08*loss_train_32+0.32*loss_train_64
+        self.loss_test = loss_test_4
+        
         self.summary_loss_train = tf.summary.scalar('train/loss', self.loss_train)
         
         update_vars = tf.global_variables()
@@ -235,7 +252,7 @@ class Model(object):
             deconv5 = deconv(conv6_1, 512, [4, 4], 2, 'SAME', scope='deconv5')
             deconvflow6 = deconv(predict6, 2, [4, 4], 2, 'SAME', scope='deconvflow6')
             concat5 = tf.concat([deconv5, conv5_1, deconvflow6], 3, name='concat5')
-            interconv5 = conv(concat5, 512, [3, 3], 1, 'SAME', scope='interconv5')  # ????不用非线性？
+            interconv5 = conv(concat5, 512, [3, 3], 1, 'SAME', scope='interconv5')
             predict5 = conv(interconv5, 2, [3, 3], 1, 'SAME', scope='predict5')   #0.08
             # 24 * 32 flow
             deconv4 = deconv(concat5, 256, [4, 4], 2, 'SAME', scope='deconv4')
@@ -258,43 +275,11 @@ class Model(object):
 
             return predict6, predict5, predict4, predict3, predict2
     
-    def test(self):
-        writer = tf.summary.FileWriter(config.log_dir, tf.get_default_graph())
-        saver = tf.train.Saver()
-        
-        
-        init_op = tf.group(tf.global_variables_initializer(), tf.local_variables_initializer())
-        self.sess.run(init_op)
-        
-        ckpt = tf.train.get_checkpoint_state(config.save_dir)
-        saver.restore(self.sess, ckpt.model_checkpoint_path)
-        
-        coord = tf.train.Coordinator()
-        threads = tf.train.start_queue_runners(sess=self.sess, coord=coord)
-        
-        time_ = time.clock()
-        
-        input_data = np.zeros((config.batch_size, config.input_height, config.input_width, config.input_channel))
-        input_label = np.zeros((config.batch_size, config.label_height, config.label_width, config.label_channel))
-    
-        
-        learning_rate_mult = 1.
-        
-        
-        predict_ = self.sess.run(self.predict_4[:, :, :, 0], feed_dict={self.inputs:input_data, self.labels:input_label, self.learning_rate_mult:learning_rate_mult})
-        
-        for i in xrange(predict_.shape[0]):
-            cv2.imwrite('./result/test/'+str(i)+'_pred.jpg', np.clip(predict_*20, 0, 255).astype(uint8))
-                
-        coord.request_stop()
-        coord.join(threads)
-        
-        writer.close()
 
   
     def train(self):
         writer = tf.summary.FileWriter(config.log_dir, tf.get_default_graph())
-        saver = tf.train.Saver()
+        saver = tf.train.Saver(max_to_keep=0)
         
         init_op = tf.group(tf.global_variables_initializer(), tf.local_variables_initializer())
         self.sess.run(init_op)
@@ -311,11 +296,12 @@ class Model(object):
 #         input_data = np.zeros((config.batch_size, config.input_height, config.input_width, config.input_channel))
 #         input_label = np.zeros((config.batch_size, config.label_height, config.label_width, config.label_channel))
     
-        
+        fhand = open('progress.txt', 'wb', 0)
         learning_rate_mult = 1.
         for t in range(0, config.num_batches):
             if t % 100 == 0:
-                print "iter ", t, " time ", time.clock()-time_
+#                 print "iter ", t, " time ", time.clock()-time_
+                fhand.write("iter "+str(t)+" time "+str(time.clock()-time_)+'==>')
                 time_ = time.clock()
             
             if t > 2000000 and (t % 1000000 == 0):
@@ -323,19 +309,24 @@ class Model(object):
 
 #             _, merge_summary = \
 #                 self.sess.run([self.opt, self.merge_summary_train], feed_dict={self.inputs:input_data, self.labels:input_label, self.learning_rate:config.learning_rate})
-            if t % 1000 == 0:
+            if t % config.vis_iter == 0:
                 _, merge_summary, loss, label_, predict_ =                    self.sess.run([self.opt, self.merge_summary_train, self.loss_train, self.labels_small_4[0, :, :, 0], self.predict_4[0, :, :, 0]], feed_dict={self.learning_rate_mult:learning_rate_mult})
-                cv2.imwrite('./result/'+str(t)+'_label.jpg', np.clip(label_*20, 0, 255).astype(uint8))
-                cv2.imwrite('./result/'+str(t)+'_pred.jpg', np.clip(predict_*20, 0, 255).astype(uint8))
+                cv2.imwrite(config.result_dir+'/'+str(t)+'_label.jpg', np.clip(label_*20, 0, 255).astype(uint8))
+                cv2.imwrite(config.result_dir+'/'+str(t)+'_pred.jpg', np.clip(predict_*20, 0, 255).astype(uint8))
             else:
                 _, merge_summary, loss =                     self.sess.run([self.opt, self.summary_loss_train, self.loss_train], feed_dict={self.learning_rate_mult:learning_rate_mult})
             
-            if t%100 == 0:
-                print "train loss is: ", loss
+            if t%config.print_iter== 0:
+#                 print "train loss is: ", loss
+                fhand.write("train loss is: "+str(loss)+'\n')
                 writer.add_summary(merge_summary, t)
                 
-           
-            if t%10000 == 0:
+            if t%config.test_iter == 0:
+                loss_test = self.sess.run(self.loss_test, feed_dict={self.learning_rate_mult:learning_rate_mult})
+                fhand.write('test loss is: '+str(loss_test)+'\n')
+        
+        
+            if t%config.save_iter == 0:
                 saver.save(self.sess, config.save_dir, global_step=t)
                 
         coord.request_stop()
